@@ -99,6 +99,27 @@
 ;;; use #-cffi-sys::no-long-double here instead.
 #+(and scl long-float) (define-built-in-foreign-type :long-double)
 
+;;; Lists of built-in types
+;;; LMH should these be added to documentation?
+(export '(*other-builtin-types* *built-in-integer-types* *built-in-float-types*))
+
+(defparameter *possible-float-types* '(:float :double :long-double))
+
+(defparameter *other-builtin-types* '(:pointer :void)
+  "List of types other than integer or float built in to CFFI.")
+
+(defparameter *built-in-integer-types*
+  (set-difference
+   cffi:*built-in-foreign-types*
+   (append *possible-float-types* *other-builtin-types*))
+  "List of integer types supported by CFFI.")
+
+(defparameter *built-in-float-types*
+  (set-difference
+   cffi:*built-in-foreign-types*
+   (append *built-in-integer-types* *other-builtin-types*))
+  "List of real float types supported by CFFI.")
+
 ;;;# Foreign Pointers
 
 (define-modify-macro incf-pointer (&optional (offset 1)) inc-pointer)
@@ -106,17 +127,19 @@
 (defun mem-ref (ptr type &optional (offset 0))
   "Return the value of TYPE at OFFSET bytes from PTR. If TYPE is aggregate,
 we don't return its 'value' but a pointer to it, which is PTR itself."
-  (let ((ptype (parse-type type)))
-    (if (aggregatep ptype)
-        (inc-pointer ptr offset)
-        (let ((ctype (canonicalize ptype)))
+  (let* ((parsed-type (parse-type type))
+         (ctype (canonicalize parsed-type)))
           #+cffi-sys::no-long-long
-          (when (or (eq ctype :long-long) (eq ctype :unsigned-long-long))
+          (when (member ctype '(:long-long :unsigned-long-long))
             (return-from mem-ref
               (translate-from-foreign (%emulated-mem-ref-64 ptr ctype offset)
-                                      ptype)))
+                                      parsed-type)))
           ;; normal branch
-          (translate-from-foreign (%mem-ref ptr ctype offset) ptype)))))
+    (if (aggregatep parsed-type)
+        (if (bare-struct-type-p parsed-type)
+            (inc-pointer ptr offset)
+            (translate-from-foreign (inc-pointer ptr offset) parsed-type))
+        (translate-from-foreign (%mem-ref ptr ctype offset) parsed-type))))
 
 (define-compiler-macro mem-ref (&whole form ptr type &optional (offset 0))
   "Compiler macro to open-code MEM-REF when TYPE is constant."
@@ -128,7 +151,9 @@ we don't return its 'value' but a pointer to it, which is PTR itself."
         (when (member ctype '(:long-long :unsigned-long-long))
           (return-from mem-ref form))
         (if (aggregatep parsed-type)
-            `(inc-pointer ,ptr ,offset)
+            (if (bare-struct-type-p parsed-type)
+                `(inc-pointer ,ptr ,offset)
+                (expand-from-foreign `(inc-pointer ,ptr ,offset) parsed-type))
             (expand-from-foreign `(%mem-ref ,ptr ,ctype ,offset) parsed-type)))
       form))
 
@@ -141,7 +166,9 @@ we don't return its 'value' but a pointer to it, which is PTR itself."
       (return-from mem-set
         (%emulated-mem-set-64 (translate-to-foreign value ptype)
                               ptr ctype offset)))
-    (%mem-set (translate-to-foreign value ptype) ptr ctype offset)))
+    (if (aggregatep ptype) ; XXX: backwards incompatible?
+        (translate-into-foreign-memory value ptype (inc-pointer ptr offset))
+        (%mem-set (translate-to-foreign value ptype) ptr ctype offset))))
 
 (define-setf-expander mem-ref (ptr type &optional (offset 0) &environment env)
   "SETF expander for MEM-REF that doesn't rebind TYPE.
@@ -180,7 +207,10 @@ to open-code (SETF MEM-REF) forms."
         #+cffi-sys::no-long-long
         (when (member ctype '(:long-long :unsigned-long-long))
           (return-from mem-set form))
-        `(%mem-set ,(expand-to-foreign value parsed-type) ,ptr ,ctype ,offset))
+        (if (aggregatep parsed-type)    ; XXX: skip for now.
+            form      ; use expand-into-foreign-memory when available.
+            `(%mem-set ,(expand-to-foreign value parsed-type)
+                       ,ptr ,ctype ,offset)))
       form))
 
 ;;;# Dereferencing Foreign Arrays
@@ -239,6 +269,30 @@ to open-code (SETF MEM-REF) forms."
                   ,@(if (and (constantp type) (constantp index))
                         (list index)
                         (list index-tmp)))))))
+
+(defmethod translate-into-foreign-memory
+    (value (type foreign-pointer-type) pointer)
+  (setf (mem-aref pointer :pointer) value))
+
+(defmethod translate-into-foreign-memory
+    (value (type foreign-built-in-type) pointer)
+  (setf (mem-aref pointer (unparse-type type)) value))
+
+(defun mem-aptr (ptr type &optional (index 0))
+  "The pointer to the element."
+  (inc-pointer ptr (* index (foreign-type-size type))))
+
+(define-compiler-macro mem-aptr (&whole form ptr type &optional (index 0))
+  "The pointer to the element."
+  (cond ((not (constantp type))
+         form)
+        ((not (constantp index))
+         `(inc-pointer ,ptr (* ,index ,(foreign-type-size (eval type)))))
+        ((zerop (eval index))
+         ptr)
+        (t
+         `(inc-pointer ,ptr ,(* (eval index)
+                                (foreign-type-size (eval type)))))))
 
 (define-foreign-type foreign-array-type ()
   ((dimensions :reader dimensions :initarg :dimensions)
@@ -498,6 +552,21 @@ The foreign array must be freed with foreign-array-free."
       (make-instance 'simple-struct-slot :offset offset :type type
                      :name name)))
 
+(defun parse-deprecated-struct-type (name struct-or-union)
+  (check-type struct-or-union (member :struct :union))
+  (let* ((struct-type-name `(,struct-or-union ,name))
+         (struct-type (parse-type struct-type-name)))
+    (simple-style-warning
+     "bare references to struct types are deprecated. ~
+      Please use ~S or ~S instead."
+     `(:pointer ,struct-type-name) struct-type-name)
+    (make-instance (class-of struct-type)
+                   :alignment (alignment struct-type)
+                   :size (size struct-type)
+                   :slots (slots struct-type)
+                   :name (name struct-type)
+                   :bare t)))
+
 ;;; Regarding structure alignment, the following ABIs were checked:
 ;;;   - System-V ABI: x86, x86-64, ppc, arm, mips and itanium. (more?)
 ;;;   - Mac OS X ABI Function Call Guide: ppc32, ppc64 and x86.
@@ -575,16 +644,21 @@ The foreign array must be freed with foreign-array-free."
         (unless (= tail-padding max-align) ; See point 3 above.
           (incf current-offset tail-padding)))
       (setf (size struct) (or size current-offset))
-      (notice-foreign-type name struct))))
+      (notice-foreign-type name struct :struct))))
 
 (defun generate-struct-accessors (name conc-name slot-names)
   (loop with pointer-arg = (symbolicate '#:pointer-to- name)
         for slot in slot-names
         for accessor = (symbolicate conc-name slot)
         collect `(defun ,accessor (,pointer-arg)
-                   (foreign-slot-value ,pointer-arg ',name ',slot))
+                   (foreign-slot-value ,pointer-arg '(:struct ,name) ',slot))
         collect `(defun (setf ,accessor) (value ,pointer-arg)
-                   (foreign-slot-set value ,pointer-arg ',name ',slot))))
+                   (foreign-slot-set value ,pointer-arg '(:struct ,name) ',slot))))
+
+(define-parse-method :struct (name)
+  (funcall (find-type-parser name :struct)))
+
+(defvar *defcstruct-hook* nil)
 
 (defmacro defcstruct (name-and-options &body fields)
   "Define the layout of a foreign structure."
@@ -593,15 +667,25 @@ The foreign array must be freed with foreign-array-free."
       (ensure-list name-and-options)
     (let ((conc-name (getf options :conc-name)))
       (remf options :conc-name)
+      (unless (getf options :class) (setf (getf options :class) (symbolicate name '-tclass)))
       `(eval-when (:compile-toplevel :load-toplevel :execute)
          ;; m-f-s-t could do with this with mop:ensure-class.
          ,(when-let (class (getf options :class))
-            `(defclass ,class (foreign-struct-type) ()))
+            `(defclass ,class (foreign-struct-type
+                               translatable-foreign-type)
+               ()))
          (notice-foreign-struct-definition ',name ',options ',fields)
          ,@(when conc-name
              (generate-struct-accessors name conc-name
                                         (mapcar #'car fields)))
-         ',name))))
+         ,@(when *defcstruct-hook*
+             ;; If non-nil, *defcstruct-hook* should be a function
+             ;; of the arguments that returns NIL or a list of
+             ;; forms to include in the expansion.
+             (apply *defcstruct-hook* name-and-options fields))
+         (define-parse-method ,name ()
+           (parse-deprecated-struct-type ',name :struct))
+         '(:struct ,name)))))
 
 ;;;## Accessing Foreign Structure Slots
 
@@ -617,9 +701,17 @@ The foreign array must be freed with foreign-array-free."
   "Return the address of SLOT-NAME in the structure at PTR."
   (foreign-struct-slot-pointer ptr (get-slot-info type slot-name)))
 
+(defun foreign-slot-type (type slot-name)
+  "Return the type of SLOT in a struct TYPE."
+  (slot-type (get-slot-info type slot-name)))
+
 (defun foreign-slot-offset (type slot-name)
   "Return the offset of SLOT in a struct TYPE."
   (slot-offset (get-slot-info type slot-name)))
+
+(defun foreign-slot-count (type slot-name)
+  "Return the number of items in SLOT in a struct TYPE."
+  (slot-count (get-slot-info type slot-name)))
 
 (defun foreign-slot-value (ptr type slot-name)
   "Return the value of SLOT-NAME in the foreign structure at PTR."
@@ -695,7 +787,7 @@ CLASS-AND-TYPE is either a list of the form (class-name
 struct-type) or a single symbol naming both.  The class will
 inherit SUPERS.  If a list of SLOTS is specified, only those
 slots will be defined and stored."
-  (destructuring-bind (class-name &optional (struct-type class-name))
+  (destructuring-bind (class-name &optional (struct-type (list :struct class-name)))
       (ensure-list class-and-type)
     (let ((slots (or slots (foreign-slot-names struct-type))))
       `(progn
@@ -713,8 +805,8 @@ slots will be defined and stored."
 
 ;;;# Foreign Unions
 ;;;
-;;; A union is a FOREIGN-STRUCT-TYPE in which all slots have an offset
-;;; of zero.
+;;; A union is a subclass of FOREIGN-STRUCT-TYPE in which all slots
+;;; have an offset of zero.
 
 ;;; See also the notes regarding ABI requirements in
 ;;; NOTICE-FOREIGN-STRUCT-DEFINITION
@@ -722,7 +814,7 @@ slots will be defined and stored."
   "Parse and install a foreign union definition."
   (destructuring-bind (name &key size)
       (ensure-list name-and-options)
-    (let ((struct (make-instance 'foreign-struct-type :name name))
+    (let ((union (make-instance 'foreign-union-type :name name))
           (max-size 0)
           (max-align 0))
       (dolist (slotdef slots)
@@ -732,20 +824,29 @@ slots will be defined and stored."
           (let* ((slot (make-struct-slot slotname 0 type count))
                  (size (* count (foreign-type-size type)))
                  (align (foreign-type-alignment (slot-type slot))))
-            (setf (gethash slotname (slots struct)) slot)
+            (setf (gethash slotname (slots union)) slot)
             (when (> size max-size)
               (setf max-size size))
             (when (> align max-align)
               (setf max-align align)))))
-      (setf (size struct) (or size max-size))
-      (setf (alignment struct) max-align)
-      (notice-foreign-type name struct))))
+      (setf (size union) (or size max-size))
+      (setf (alignment union) max-align)
+      (notice-foreign-type name union :union))))
 
-(defmacro defcunion (name &body fields)
+(define-parse-method :union (name)
+  (funcall (find-type-parser name :union)))
+
+(defmacro defcunion (name-and-options &body fields)
   "Define the layout of a foreign union."
   (discard-docstring fields)
-  `(eval-when (:compile-toplevel :load-toplevel :execute)
-     (notice-foreign-union-definition ',name ',fields)))
+  (destructuring-bind (name &key size)
+      (ensure-list name-and-options)
+    (declare (ignore size))
+    `(eval-when (:compile-toplevel :load-toplevel :execute)
+       (notice-foreign-union-definition ',name-and-options ',fields)
+       (define-parse-method ,name ()
+         (parse-deprecated-struct-type ',name :union))
+       '(:union ,name))))
 
 ;;;# Operations on Types
 

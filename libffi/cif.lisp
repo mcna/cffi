@@ -1,8 +1,8 @@
 ;;;; -*- Mode: lisp; indent-tabs-mode: nil -*-
 ;;;
-;;; union.lisp --- Tests on C unions.
+;;; cif.lisp --- Structure and function call function in libffi
 ;;;
-;;; Copyright (C) 2005-2006, James Bielman  <jamesjb@jamesjb.com>
+;;; Copyright (C) 2009, 2010, 2011 Liam Healy  <lhealy@common-lisp.net>
 ;;;
 ;;; Permission is hereby granted, free of charge, to any person
 ;;; obtaining a copy of this software and associated documentation
@@ -25,28 +25,30 @@
 ;;; DEALINGS IN THE SOFTWARE.
 ;;;
 
-(in-package #:cffi-tests)
+(in-package #:cffi)
 
-(defcunion uint32-bytes
-  (int-value :unsigned-int)
-  (bytes :unsigned-char :count 4))
+;;; Structs
 
-(defctype uint32-bytes (:union uint32-bytes))
+(cffi:defcstruct ffi-cif
+  (abi ffi-abi)
+  (number-of-arguments unsigned)
+  (argument-types :pointer)
+  (return-type :pointer)
+  (bytes unsigned)
+  (flags unsigned))
 
-(defun int-to-bytes (n)
-  "Convert N to a list of bytes using a union."
-  (with-foreign-object (obj 'uint32-bytes)
-    (setf (foreign-slot-value obj 'uint32-bytes 'int-value) n)
-    (loop for i from 0 below 4
-          collect (mem-aref
-                   (foreign-slot-value obj 'uint32-bytes 'bytes)
-                   :unsigned-char i))))
+;;; Functions
+;;; See file:///usr/share/doc/libffi-dev/html/The-Basics.html#The-Basics
 
-(deftest union.1
-    (let ((bytes (int-to-bytes #x12345678)))
-      (cond ((equal bytes '(#x12 #x34 #x56 #x78))
-             t)
-            ((equal bytes '(#x78 #x56 #x34 #x12))
-             t)
-            (t bytes)))
-  t)
+(cffi:defcfun ("ffi_prep_cif" prep-cif) status
+  (ffi-cif :pointer)
+  (ffi-abi abi)
+  (nargs :uint)
+  (rtype :pointer)
+  (argtypes :pointer))
+
+(cffi:defcfun ("ffi_call" call) :void
+  (ffi-cif :pointer)
+  (function :pointer)
+  (rvalue :pointer)
+  (avalues :pointer))

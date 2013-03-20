@@ -3,6 +3,7 @@
 ;;; cffi-tests.asd --- ASDF system definition for CFFI unit tests.
 ;;;
 ;;; Copyright (C) 2005-2006, James Bielman  <jamesjb@jamesjb.com>
+;;; Copyright (C) 2005-2011, Luis Oliveira  <loliveira@common-lisp.net>
 ;;;
 ;;; Permission is hereby granted, free of charge, to any person
 ;;; obtaining a copy of this software and associated documentation
@@ -56,7 +57,7 @@
 
 (defsystem cffi-tests
   :description "Unit tests for CFFI."
-  :depends-on (cffi #-ecl rt)
+  :depends-on (cffi-libffi bordeaux-threads #-ecl rt)
   :components
   ((:module "tests"
     :serial t
@@ -71,6 +72,7 @@
      (:file "memory")
      (:file "strings")
      (:file "struct")
+     (:file "fsbv")
      (:file "union")
      (:file "enum")
      (:file "misc-types")

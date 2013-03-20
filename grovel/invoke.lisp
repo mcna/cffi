@@ -3,8 +3,8 @@
 ;;; invoke.lisp --- Half-baked portable run-program.
 ;;;
 ;;; Copyright (C) 2005-2006, Dan Knap <dankna@accela.net>
-;;; Copyright (C) 2005-2006, Matthew Backes <lucca@accela.net>
-;;; Copyright (C) 2007, Stelian Ionescu <stelian.ionescu-zeus@poste.it>
+;;; Copyright (C) 2005-2006, Emily Backes <lucca@accela.net>
+;;; Copyright (C) 2007, Stelian Ionescu <sionescu@cddr.org>
 ;;; Copyright (C) 2007, Luis Oliveira <loliveira@common-lisp.net>
 ;;;
 ;;; Permission is hereby granted, free of charge, to any person
@@ -39,7 +39,7 @@
 #+abcl
 (defun %invoke (command arglist)
   (let ((cmdline (reduce (lambda (str1 str2)
-                           (concatenate 'string str1 #\Space str2))
+                           (concatenate 'string str1 " " str2))
                          arglist :initial-value command))
         (stream (make-string-output-stream)))
     (values (ext:run-shell-command cmdline :output stream)

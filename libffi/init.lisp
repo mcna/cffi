@@ -1,8 +1,8 @@
 ;;;; -*- Mode: lisp; indent-tabs-mode: nil -*-
 ;;;
-;;; union.lisp --- Tests on C unions.
+;;; init.lisp --- Load libffi and define #'libffi-type-pointer
 ;;;
-;;; Copyright (C) 2005-2006, James Bielman  <jamesjb@jamesjb.com>
+;;; Copyright (C) 2009, 2011 Liam M. Healy
 ;;;
 ;;; Permission is hereby granted, free of charge, to any person
 ;;; obtaining a copy of this software and associated documentation
@@ -25,28 +25,27 @@
 ;;; DEALINGS IN THE SOFTWARE.
 ;;;
 
-(in-package #:cffi-tests)
+(in-package #:cffi)
 
-(defcunion uint32-bytes
-  (int-value :unsigned-int)
-  (bytes :unsigned-char :count 4))
+(cffi:define-foreign-library (libffi)
+  (:darwin (:or "libffi.dylib" "libffi32.dylib"))
+  (:unix (:or "libffi.so.6" "libffi32.so.6" "libffi.so.5" "libffi32.so.5"))
+  (:windows (:or "libffi-6.dll" "libffi-5.dll" "libffi.dll"))
+  (t (:default "libffi")))
 
-(defctype uint32-bytes (:union uint32-bytes))
+(cffi:load-foreign-library 'libffi)
 
-(defun int-to-bytes (n)
-  "Convert N to a list of bytes using a union."
-  (with-foreign-object (obj 'uint32-bytes)
-    (setf (foreign-slot-value obj 'uint32-bytes 'int-value) n)
-    (loop for i from 0 below 4
-          collect (mem-aref
-                   (foreign-slot-value obj 'uint32-bytes 'bytes)
-                   :unsigned-char i))))
+(defvar *libffi-type-pointer* (make-hash-table))
 
-(deftest union.1
-    (let ((bytes (int-to-bytes #x12345678)))
-      (cond ((equal bytes '(#x12 #x34 #x56 #x78))
-             t)
-            ((equal bytes '(#x78 #x56 #x34 #x12))
-             t)
-            (t bytes)))
-  t)
+(defgeneric libffi-type-pointer (object)
+  (:documentation "The type pointer defined by libffi.")
+  (:method ((object symbol))
+    (libffi-type-pointer (parse-type object)))
+  (:method (object)
+    (gethash object *libffi-type-pointer*)))
+
+(defun set-libffi-type-pointer (type pointer)
+  "Set the hash table entry for the libffi type pointer."
+  (setf (gethash (if (symbolp type) (parse-type type) type)
+                 *libffi-type-pointer*)
+        pointer))

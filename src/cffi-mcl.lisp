@@ -1,8 +1,9 @@
 ;;;; -*- Mode: lisp; indent-tabs-mode: nil -*-
 ;;;
-;;; cffi-openmcl.lisp --- CFFI-SYS implementation for OpenMCL.
+;;; cffi-mcl.lisp --- CFFI-SYS implementation for Digitool MCL.
 ;;;
-;;; Copyright (C) 2005-2006, James Bielman  <jamesjb@jamesjb.com>
+;;; Copyright 2010 james.anderson@setf.de
+;;; Copyright 2005-2006, James Bielman  <jamesjb@jamesjb.com>
 ;;;
 ;;; Permission is hereby granted, free of charge, to any person
 ;;; obtaining a copy of this software and associated documentation
@@ -24,6 +25,17 @@
 ;;; OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 ;;; DEALINGS IN THE SOFTWARE.
 ;;;
+
+;;; this is a stop-gap emulation. (at least) three things are not right
+;;; - integer vector arguments are copied
+;;; - return values are not typed
+;;; - a shared library must be packaged as a framework and statically loaded
+;;; 
+;;; on the topic of shared libraries, see
+;;; http://developer.apple.com/library/mac/#documentation/DeveloperTools/Conceptual/MachOTopics/1-Articles/loading_code.html
+;;; which describes how to package a shared library as a framework.
+;;; once a framework exists, load it as, eg.
+;;; (ccl::add-framework-bundle "fftw.framework" :pathname "ccl:frameworks;" )
 
 ;;;# Administrivia
 
@@ -79,12 +91,12 @@
 
 (defun %foreign-alloc (size)
   "Allocate SIZE bytes on the heap and return a pointer."
-  (ccl::malloc size))
+  (#_newPtr size))
 
 (defun foreign-free (ptr)
   "Free a PTR allocated by FOREIGN-ALLOC."
   ;; TODO: Should we make this a dead macptr?
-  (ccl::free ptr))
+  (#_disposePtr ptr))
 
 (defmacro with-foreign-pointer ((var size &optional size-var) &body body)
   "Bind VAR to SIZE bytes of foreign memory during BODY.  The
@@ -94,7 +106,7 @@ SIZE-VAR is supplied, it will be bound to SIZE during BODY."
   (unless size-var
     (setf size-var (gensym "SIZE")))
   `(let ((,size-var ,size))
-     (%stack-block ((,var ,size-var))
+     (ccl:%stack-block ((,var ,size-var))
        ,@body)))
 
 ;;;# Misc. Pointer Operations
@@ -137,10 +149,22 @@ SIZE-VAR is supplied, it will be bound to SIZE during BODY."
 WITH-POINTER-TO-VECTOR-DATA."
   (make-array size :element-type '(unsigned-byte 8)))
 
-(defmacro with-pointer-to-vector-data ((ptr-var vector) &body body)
+;;; from openmcl::macros.lisp
+
+(defmacro with-pointer-to-vector-data ((ptr ivector) &body body)
   "Bind PTR-VAR to a foreign pointer to the data in VECTOR."
-  `(ccl:with-pointer-to-ivector (,ptr-var ,vector)
-     ,@body))
+  (let* ((v (gensym))
+         (l (gensym)))
+    `(let* ((,v ,ivector)
+            (,l (length ,v)))
+       (unless (typep ,v 'ccl::ivector) (ccl::report-bad-arg ,v 'ccl::ivector))
+       ;;;!!! this, unless it's possible to suppress gc
+       (let ((,ptr (#_newPtr ,l)))
+         (unwind-protect (progn (ccl::%copy-ivector-to-ptr ,v 0 ,ptr 0 ,l)
+                                (mutliple-value-prog1
+                                 (locally ,@body)
+                                 (ccl::%copy-ptr-to-ivector ,ptr 0 ,v 0 ,l)))
+           (#_disposePtr ,ptr))))))
 
 ;;;# Dereferencing
 
@@ -181,29 +205,49 @@ WITH-POINTER-TO-VECTOR-DATA."
   (:unsigned-short %get-unsigned-word)
   (:int %get-signed-long)
   (:unsigned-int %get-unsigned-long)
-  #+32-bit-target (:long %get-signed-long)
-  #+64-bit-target (:long ccl::%%get-signed-longlong)
-  #+32-bit-target (:unsigned-long %get-unsigned-long)
-  #+64-bit-target (:unsigned-long ccl::%%get-unsigned-longlong)
+  (:long %get-signed-long)
+  (:unsigned-long %get-unsigned-long)
   (:long-long ccl::%get-signed-long-long)
   (:unsigned-long-long ccl::%get-unsigned-long-long)
   (:float %get-single-float)
   (:double %get-double-float)
   (:pointer %get-ptr))
 
+
+(defun ccl::%get-unsigned-long-long (ptr offset)
+  (let ((value 0) (bit 0))
+    (dotimes (i 8)
+      (setf (ldb (byte 8 (shiftf bit (+ bit 8))) value)
+            (ccl:%get-unsigned-byte ptr (+ offset i))))
+    value))
+
+(setf (fdefinition 'ccl::%get-signed-long-long)
+      (fdefinition 'ccl::%get-unsigned-long-long))
+
+(defun (setf ccl::%get-unsigned-long-long) (value ptr offset)
+  (let ((bit 0))
+    (dotimes (i 8)
+      (setf (ccl:%get-unsigned-byte ptr (+ offset i))
+            (ldb (byte 8 (shiftf bit (+ bit 8))) value))))
+  ptr)
+
+(setf (fdefinition '(setf ccl::%get-signed-long-long))
+      (fdefinition '(setf ccl::%get-unsigned-long-long)))
+
+
 ;;;# Calling Foreign Functions
 
 (defun convert-foreign-type (type-keyword)
-  "Convert a CFFI type keyword to an OpenMCL type."
+  "Convert a CFFI type keyword to a ppc-ff-call type."
   (ecase type-keyword
     (:char                :signed-byte)
     (:unsigned-char       :unsigned-byte)
     (:short               :signed-short)
     (:unsigned-short      :unsigned-short)
-    (:int                 :signed-int)
-    (:unsigned-int        :unsigned-int)
-    (:long                :signed-long)
-    (:unsigned-long       :unsigned-long)
+    (:int                 :signed-fullword)
+    (:unsigned-int        :unsigned-fullword)
+    (:long                :signed-fullword)
+    (:unsigned-long       :unsigned-fullword)
     (:long-long           :signed-doubleword)
     (:unsigned-long-long  :unsigned-doubleword)
     (:float               :single-float)
@@ -211,20 +255,42 @@ WITH-POINTER-TO-VECTOR-DATA."
     (:pointer             :address)
     (:void                :void)))
 
+(defun ppc-ff-call-type=>mactype-name (type-keyword)
+  (ecase type-keyword
+    (:signed-byte          :sint8)
+    (:unsigned-byte        :uint8)
+    (:signed-short         :sint16)
+    (:unsigned-short       :uint16)
+    (:signed-halfword      :sint16)
+    (:unsigned-halfword    :uint16)
+    (:signed-fullword      :sint32)
+    (:unsigned-fullword    :uint32)
+    ;(:signed-doubleword    :long-long)
+    ;(:unsigned-doubleword  :unsigned-long-long)
+    (:single-float         :single-float)
+    (:double-float         :double-float)
+    (:address              :pointer)
+    (:void                 :void)))
+
+
+
 (defun %foreign-type-size (type-keyword)
   "Return the size in bytes of a foreign type."
-  (/ (ccl::foreign-type-bits
-      (ccl::parse-foreign-type
-       (convert-foreign-type type-keyword)))
-     8))
+  (case type-keyword
+    ((:long-long :unsigned-long-long) 8)
+    (t (ccl::mactype-record-size
+        (ccl::find-mactype
+         (ppc-ff-call-type=>mactype-name (convert-foreign-type type-keyword)))))))
 
 ;; There be dragons here.  See the following thread for details:
 ;; http://clozure.com/pipermail/openmcl-devel/2005-June/002777.html
 (defun %foreign-type-alignment (type-keyword)
   "Return the alignment in bytes of a foreign type."
-  (/ (ccl::foreign-type-alignment
-      (ccl::parse-foreign-type
-       (convert-foreign-type type-keyword))) 8))
+  (case type-keyword
+    ((:long-long :unsigned-long-long) 4)
+    (t (ccl::mactype-record-size
+        (ccl::find-mactype
+         (ppc-ff-call-type=>mactype-name (convert-foreign-type type-keyword)))))))
 
 (defun convert-foreign-funcall-types (args)
   "Convert foreign types for a call to FOREIGN-FUNCALL."
@@ -233,20 +299,19 @@ WITH-POINTER-TO-VECTOR-DATA."
         if arg collect arg))
 
 (defun convert-external-name (name)
-  "Add an underscore to NAME if necessary for the ABI."
-  #+darwin (concatenate 'string "_" name)
-  #-darwin name)
+  "no '_' is necessary here, the internal lookup operators handle it"
+  name)
 
 (defmacro %foreign-funcall (function-name args &key library convention)
   "Perform a foreign function call, document it more later."
   (declare (ignore library convention))
-  `(external-call
-    ,(convert-external-name function-name)
+  `(ccl::ppc-ff-call
+    (ccl::macho-address ,(ccl::get-macho-entry-point (convert-external-name function-name)))
     ,@(convert-foreign-funcall-types args)))
 
 (defmacro %foreign-funcall-pointer (ptr args &key convention)
   (declare (ignore convention))
-  `(ff-call ,ptr ,@(convert-foreign-funcall-types args)))
+  `(ccl::ppc-ff-call ,ptr ,@(convert-foreign-funcall-types args)))
 
 ;;;# Callbacks
 
@@ -274,15 +339,15 @@ WITH-POINTER-TO-VECTOR-DATA."
 
 (defmacro %defcallback (name rettype arg-names arg-types body
                         &key convention)
+  (declare (ignore convention))
   (let ((cb-name (intern-callback name)))
     `(progn
-       (defcallback ,cb-name
-           (,@(when (eq convention :stdcall)
-                '(:discard-stack-args))
+       (ccl::ppc-defpascal ,cb-name
+           (;; ? ,@(when (eq convention :stdcall) '(:discard-stack-args))
             ,@(mapcan (lambda (sym type)
-                        (list (convert-foreign-type type) sym))
+                        (list (ppc-ff-call-type=>mactype-name (convert-foreign-type type)) sym))
                       arg-names arg-types)
-            ,(convert-foreign-type rettype))
+            ,(ppc-ff-call-type=>mactype-name (convert-foreign-type rettype)))
          ,body)
        (setf (gethash ',name *callbacks*) (symbol-value ',cb-name)))))
 
@@ -294,21 +359,38 @@ WITH-POINTER-TO-VECTOR-DATA."
 
 (defun %load-foreign-library (name path)
   "Load the foreign library NAME."
-  (declare (ignore name))
-  (open-shared-library path))
+  (declare (ignore path))
+  (setf name (string name))
+  ;; for mcl emulate this wrt frameworks
+  (unless (and (> (length name) 10)
+               (string-equal name ".framework" :start1 (- (length name) 10)))
+    (setf name (concatenate 'string name ".framework")))
+  ;; if the framework was not registered, add it
+  (unless (gethash name ccl::*framework-descriptors*)
+    (ccl::add-framework-bundle name :pathname "ccl:frameworks;" ))
+  (ccl::load-framework-bundle name))
 
 (defun %close-foreign-library (name)
   "Close the foreign library NAME."
-  ;; C-S-L sometimes ends in an endless loop
-  ;; with :COMPLETELY T
-  (close-shared-library name :completely nil))
+  ;; for mcl do nothing
+  (declare (ignore name))
+  nil)
 
 (defun native-namestring (pathname)
-  (ccl::native-translated-namestring pathname))
+  (ccl::posix-namestring (ccl:full-pathname pathname)))
+
 
 ;;;# Foreign Globals
+
+(deftrap-inline "_findsymbol"
+    ((map :pointer)
+     (name :pointer))
+    :pointer
+    ())
+
 
 (defun %foreign-symbol-pointer (name library)
   "Returns a pointer to a foreign symbol NAME."
   (declare (ignore library))
-  (foreign-symbol-address (convert-external-name name)))
+  (ccl::macho-address
+   (ccl::get-macho-entry-point (convert-external-name name))))

@@ -81,28 +81,28 @@
              #+big-endian
              `(setf (mem-ref ,ptr :uint16 ,off) ,val)
              #-big-endian
-             `(setf (mem-ref ,ptr :uint8 (1+ ,off)) (ldb (byte 8 0) val)
-                    (mem-ref ,ptr :uint8 ,off) (ldb (byte 8 8) val))
+             `(setf (mem-ref ,ptr :uint8 (1+ ,off)) (ldb (byte 8 0) ,val)
+                    (mem-ref ,ptr :uint8 ,off) (ldb (byte 8 8) ,val))
              #+little-endian
              `(setf (mem-ref ,ptr :uint16 ,off) ,val)
              #-little-endian
-             `(setf (mem-ref ,ptr :uint8 ,off) (ldb (byte 8 0) val)
-                    (mem-ref ,ptr :uint8 (1+ ,off)) (ldb (byte 8 8) val))))
+             `(setf (mem-ref ,ptr :uint8 ,off) (ldb (byte 8 0) ,val)
+                    (mem-ref ,ptr :uint8 (1+ ,off)) (ldb (byte 8 8) ,val))))
       (4 (if big-endian
              #+big-endian
              `(setf (mem-ref ,ptr :uint32 ,off) ,val)
              #-big-endian
-             `(setf (mem-ref ,ptr :uint8 (+ 3 ,off)) (ldb (byte 8 0) val)
-                    (mem-ref ,ptr :uint8 (+ 2 ,off)) (ldb (byte 8 8) val)
-                    (mem-ref ,ptr :uint8 (1+ ,off)) (ldb (byte 8 16) val)
-                    (mem-ref ,ptr :uint8 ,off) (ldb (byte 8 24) val))
+             `(setf (mem-ref ,ptr :uint8 (+ 3 ,off)) (ldb (byte 8 0) ,val)
+                    (mem-ref ,ptr :uint8 (+ 2 ,off)) (ldb (byte 8 8) ,val)
+                    (mem-ref ,ptr :uint8 (1+ ,off)) (ldb (byte 8 16) ,val)
+                    (mem-ref ,ptr :uint8 ,off) (ldb (byte 8 24) ,val))
              #+little-endian
              `(setf (mem-ref ,ptr :uint32 ,off) ,val)
              #-little-endian
-             `(setf (mem-ref ,ptr :uint8 ,off) (ldb (byte 8 0) val)
-                    (mem-ref ,ptr :uint8 (1+ ,off)) (ldb (byte 8 8) val)
-                    (mem-ref ,ptr :uint8 (+ ,off 2)) (ldb (byte 8 16) val)
-                    (mem-ref ,ptr :uint8 (+ ,off 3)) (ldb (byte 8 24) val)))))))
+             `(setf (mem-ref ,ptr :uint8 ,off) (ldb (byte 8 0) ,val)
+                    (mem-ref ,ptr :uint8 (1+ ,off)) (ldb (byte 8 8) ,val)
+                    (mem-ref ,ptr :uint8 (+ ,off 2)) (ldb (byte 8 16) ,val)
+                    (mem-ref ,ptr :uint8 (+ ,off 3)) (ldb (byte 8 24) ,val)))))))
 
 ;;; TODO: tackle optimization notes.
 (defparameter *foreign-string-mappings*
@@ -187,14 +187,14 @@ The string must be freed with FOREIGN-STRING-FREE."
     (declare (type simple-string string))
     (let* ((mapping (lookup-mapping *foreign-string-mappings* encoding))
            (count (funcall (octet-counter mapping) string start end 0))
-           (length (if null-terminated-p
-                       (+ count (null-terminator-len encoding))
-                       count))
+           (nul-length (if null-terminated-p
+                           (null-terminator-len encoding)
+                           0))
+           (length (+ count nul-length))
            (ptr (foreign-alloc :char :count length)))
       (funcall (encoder mapping) string start end ptr 0)
-      (when null-terminated-p
-        (dotimes (i (null-terminator-len encoding))
-          (setf (mem-ref ptr :char (+ count i)) 0)))
+      (dotimes (i nul-length)
+        (setf (mem-ref ptr :char (+ count i)) 0))
       (values ptr length))))
 
 (defun foreign-string-free (ptr)

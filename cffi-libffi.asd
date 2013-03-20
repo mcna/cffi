@@ -1,8 +1,8 @@
 ;;;; -*- Mode: lisp; indent-tabs-mode: nil -*-
 ;;;
-;;; union.lisp --- Tests on C unions.
+;;; cffi-libffi.asd --- Foreign Structures By Value
 ;;;
-;;; Copyright (C) 2005-2006, James Bielman  <jamesjb@jamesjb.com>
+;;; Copyright (C) 2011 Liam M. Healy
 ;;;
 ;;; Permission is hereby granted, free of charge, to any person
 ;;; obtaining a copy of this software and associated documentation
@@ -25,28 +25,27 @@
 ;;; DEALINGS IN THE SOFTWARE.
 ;;;
 
-(in-package #:cffi-tests)
+(in-package :asdf)
 
-(defcunion uint32-bytes
-  (int-value :unsigned-int)
-  (bytes :unsigned-char :count 4))
+(eval-when (:compile-toplevel :execute)
+  (asdf:oos 'asdf:load-op :cffi-grovel)
+  (asdf:oos 'asdf:load-op :trivial-features))
 
-(defctype uint32-bytes (:union uint32-bytes))
-
-(defun int-to-bytes (n)
-  "Convert N to a list of bytes using a union."
-  (with-foreign-object (obj 'uint32-bytes)
-    (setf (foreign-slot-value obj 'uint32-bytes 'int-value) n)
-    (loop for i from 0 below 4
-          collect (mem-aref
-                   (foreign-slot-value obj 'uint32-bytes 'bytes)
-                   :unsigned-char i))))
-
-(deftest union.1
-    (let ((bytes (int-to-bytes #x12345678)))
-      (cond ((equal bytes '(#x12 #x34 #x56 #x78))
-             t)
-            ((equal bytes '(#x78 #x56 #x34 #x12))
-             t)
-            (t bytes)))
-  t)
+(defsystem cffi-libffi
+  :description "Foreign structures by value"
+  :author "Liam Healy <lhealy@common-lisp.net>"
+  :maintainer "Liam Healy <lhealy@common-lisp.net>"
+  :defsystem-depends-on (#:trivial-features #:cffi-grovel)
+  :components
+  ((:module libffi
+    :serial t
+    :components
+    ((:file "init")
+     (cffi-grovel:grovel-file
+      "libffi"
+      :pathname #+unix "libffi-unix" #+windows "libffi-win32")
+     (:file "built-in-types")
+     (:file "cstruct")
+     (:file "cif")
+     (:file "functions"))))
+  :depends-on (#:cffi #:cffi-grovel #:trivial-features))

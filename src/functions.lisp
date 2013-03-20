@@ -40,14 +40,17 @@
 ;;; TRANSLATE-OBJECTS as the CALL-FORM argument) instead of
 ;;; CFFI-SYS:%FOREIGN-FUNCALL to call the foreign-function.
 
-(defun translate-objects (syms args types rettype call-form)
-  "Helper function for FOREIGN-FUNCALL and DEFCFUN."
+(defun translate-objects (syms args types rettype call-form &optional indirect)
+  "Helper function for FOREIGN-FUNCALL and DEFCFUN.  If 'indirect is T, all arguments are represented by foreign pointers, even those that can be represented by CL objects."
   (if (null args)
       (expand-from-foreign call-form (parse-type rettype))
-      (expand-to-foreign-dyn
+      (funcall
+       (if indirect
+           #'expand-to-foreign-dyn-indirect
+           #'expand-to-foreign-dyn)
        (car args) (car syms)
        (list (translate-objects (cdr syms) (cdr args)
-                                (cdr types) rettype call-form))
+                                (cdr types) rettype call-form indirect))
        (parse-type (car types)))))
 
 (defun parse-args-and-types (args)
@@ -85,17 +88,49 @@
            (unless pointer
              (list :library library)))))
 
+(defun structure-by-value-p (ctype)
+  "A structure or union is to be called or returned by value."
+  (let ((actual-type (follow-typedefs (parse-type ctype))))
+    (or (and (typep actual-type 'foreign-struct-type)
+             (not (bare-struct-type-p actual-type)))
+        #+cffi::no-long-long (typep actual-type 'emulated-llong-type))))
+
+(defun fn-call-by-value-p (argument-types return-type)
+  "One or more structures in the arguments or return from the function are called by value."
+  (or (some 'structure-by-value-p argument-types)
+      (structure-by-value-p return-type)))
+
+(defvar *foreign-structures-by-value*
+  (lambda (&rest args)
+    (declare (ignore args))
+    (restart-case
+        (error "Unable to call structures by value without cffi-libffi loaded.")
+      (load-cffi-libffi () :report "Load cffi-libffi."
+        (asdf:operate 'asdf:load-op 'cffi-libffi))))
+  "A function that produces a form suitable for calling structures by value.")
+
 (defun foreign-funcall-form (thing options args pointerp)
   (multiple-value-bind (types ctypes fargs rettype)
       (parse-args-and-types args)
-    (let ((syms (make-gensym-list (length fargs))))
+    (let ((syms (make-gensym-list (length fargs)))
+          (fsbvp (fn-call-by-value-p ctypes rettype)))
       (translate-objects
        syms fargs types rettype
-       `(,(if pointerp '%foreign-funcall-pointer '%foreign-funcall)
-         ,thing
-         (,@(mapcan #'list ctypes syms)
-            ,(canonicalize-foreign-type rettype))
-         ,@(parse-function-options options :pointer pointerp))))))
+       (if fsbvp
+           ;; Structures by value call through *foreign-structures-by-value*
+           (funcall *foreign-structures-by-value*
+                    thing
+                    syms
+                    rettype
+                    ctypes
+                    pointerp)
+           `(,(if pointerp '%foreign-funcall-pointer '%foreign-funcall)
+             ;; No structures by value, direct call
+             ,thing
+             (,@(mapcan #'list ctypes syms)
+              ,(canonicalize-foreign-type rettype))
+             ,@(parse-function-options options :pointer pointerp)))
+       fsbvp))))
 
 (defmacro foreign-funcall (name-and-options &rest args)
   "Wrapper around %FOREIGN-FUNCALL that translates its arguments."
@@ -179,19 +214,27 @@ arguments and does type promotion for the variadic arguments."
                           ,@options)))))
 
 (defun %defcfun (lisp-name foreign-name return-type args options docstring)
-  (let ((arg-names (mapcar #'car args))
-        (arg-types (mapcar #'cadr args))
-        (syms (make-gensym-list (length args))))
+  (let* ((arg-names (mapcar #'first args))
+         (arg-types (mapcar #'second args))
+         (syms (make-gensym-list (length args)))
+         (call-by-value (fn-call-by-value-p arg-types return-type)))
     (multiple-value-bind (prelude caller)
-        (defcfun-helper-forms
-          foreign-name lisp-name (canonicalize-foreign-type return-type)
-          syms (mapcar #'canonicalize-foreign-type arg-types) options)
+        (if call-by-value
+            (values nil nil)
+            (defcfun-helper-forms
+             foreign-name lisp-name (canonicalize-foreign-type return-type)
+             syms (mapcar #'canonicalize-foreign-type arg-types) options))
       `(progn
          ,prelude
          (defun ,lisp-name ,arg-names
            ,@(ensure-list docstring)
-           ,(translate-objects
-             syms arg-names arg-types return-type caller))))))
+           ,(if call-by-value
+                `(foreign-funcall
+                  ,(cons foreign-name options)
+                  ,@(append (mapcan #'list arg-types arg-names)
+                            (list return-type)))
+                (translate-objects
+                 syms arg-names arg-types return-type caller)))))))
 
 (defun %defcfun-varargs (lisp-name foreign-name return-type args options doc)
   (with-unique-names (varargs)
@@ -205,8 +248,134 @@ arguments and does type promotion for the variadic arguments."
            ,@,varargs
            ,',return-type)))))
 
-;;; The following four functions take care of parsing DEFCFUN's first
-;;; argument whose syntax can be one of:
+(defgeneric translate-underscore-separated-name (name)
+  (:method ((name string))
+    (values (intern (canonicalize-symbol-name-case (substitute #\- #\_ name)))))
+  (:method ((name symbol))
+    (substitute #\_ #\- (string-downcase (symbol-name name)))))
+
+(defun collapse-prefix (l special-words)
+  (unless (null l)
+    (multiple-value-bind (newpre skip) (check-prefix l special-words)
+      (cons newpre (collapse-prefix (nthcdr skip l) special-words)))))
+
+(defun check-prefix (l special-words)
+  (let ((pl (loop for i from (1- (length l)) downto 0
+                  collect (apply #'concatenate 'simple-string (butlast l i)))))
+    (loop for w in special-words
+          for p = (position-if #'(lambda (s) (string= s w)) pl)
+          when p do (return-from check-prefix (values (nth p pl) (1+ p))))
+    (values (first l) 1)))
+
+(defun split-if (test seq &optional (dir :before))
+  (remove-if #'(lambda (x) (equal x (subseq seq 0 0)))
+             (loop for start fixnum = 0
+                     then (if (eq dir :before)
+                              stop
+                              (the fixnum (1+ (the fixnum stop))))
+                   while (< start (length seq))
+                   for stop = (position-if test seq
+                                           :start (if (eq dir :elide)
+                                                      start
+                                                      (the fixnum (1+ start))))
+                   collect (subseq seq start
+                                   (if (and stop (eq dir :after))
+                                       (the fixnum (1+ (the fixnum stop)))
+                                       stop))
+                   while stop)))
+
+(defgeneric translate-camelcase-name (name &key upper-initial-p special-words)
+  (:method ((name string) &key upper-initial-p special-words)
+    (declare (ignore upper-initial-p))
+    (values (intern (reduce #'(lambda (s1 s2)
+                                (concatenate 'simple-string s1 "-" s2))
+                            (mapcar #'string-upcase
+                                    (collapse-prefix
+                                     (split-if #'(lambda (ch)
+                                                   (or (upper-case-p ch)
+                                                       (digit-char-p ch)))
+                                               name)
+                                     special-words))))))
+  (:method ((name symbol) &key upper-initial-p special-words)
+    (apply #'concatenate
+           'string
+           (loop for str in (split-if #'(lambda (ch) (eq ch #\-))
+                                          (string name)
+                                      :elide)
+                 for first-word-p = t then nil
+                 for e = (member str special-words
+                                 :test #'equal :key #'string-upcase)
+                 collect (cond
+                           ((and first-word-p (not upper-initial-p))
+                            (string-downcase str))
+                           (e (first e))
+                           (t (string-capitalize str)))))))
+
+(defgeneric translate-name-from-foreign (foreign-name package &optional varp)
+  (:method (foreign-name package &optional varp)
+    (declare (ignore package))
+    (let ((sym (translate-underscore-separated-name foreign-name)))
+      (if varp
+          (values (intern (format nil "*~A*"
+                                  (canonicalize-symbol-name-case
+                                   (symbol-name sym)))))
+          sym))))
+
+(defgeneric translate-name-to-foreign (lisp-name package &optional varp)
+  (:method (lisp-name package &optional varp)
+    (declare (ignore package))
+    (let ((name (translate-underscore-separated-name lisp-name)))
+      (if varp
+          (string-trim '(#\*) name)
+          name))))
+
+(defun lisp-name (spec varp)
+  (check-type spec string)
+  (translate-name-from-foreign spec *package* varp))
+
+(defun foreign-name (spec varp)
+  (check-type spec (and symbol (not null)))
+  (translate-name-to-foreign spec *package* varp))
+
+(defun foreign-options (opts varp)
+  (if varp
+      (funcall 'parse-defcvar-options opts)
+      (parse-function-options opts)))
+
+(defun lisp-name-p (name)
+  (and name (symbolp name) (not (keywordp name))))
+
+(defun %parse-name-and-options (spec varp)
+  (cond
+    ((stringp spec)
+     (values (lisp-name spec varp) spec nil))
+    ((symbolp spec)
+     (assert (not (null spec)))
+     (values spec (foreign-name spec varp) nil))
+    ((and (consp spec) (stringp (first spec)))
+     (destructuring-bind (foreign-name &rest options)
+         spec
+       (cond
+         ((or (null options)
+              (keywordp (first options)))
+          (values (lisp-name foreign-name varp) foreign-name options))
+         (t
+          (assert (lisp-name-p (first options)))
+          (values (first options) foreign-name (rest options))))))
+    ((and (consp spec) (lisp-name-p (first spec)))
+     (destructuring-bind (lisp-name &rest options)
+         spec
+       (cond
+         ((or (null options)
+              (keywordp (first options)))
+          (values lisp-name (foreign-name spec varp) options))
+         (t
+          (assert (stringp (first options)))
+          (values lisp-name (first options) (rest options))))))
+    (t
+     (error "Not a valid foreign function specifier: ~A" spec))))
+
+;;; DEFCFUN's first argument has can have the following syntax:
 ;;;
 ;;;     1.  string
 ;;;     2.  symbol
@@ -217,46 +386,10 @@ arguments and does type promotion for the variadic arguments."
 ;;; symbol argument is used to name the Lisp function. If one isn't
 ;;; present, its name is derived from the other. See the user
 ;;; documentation for an explanation of the derivation rules.
-
-(defun lisp-name (spec &optional varp)
-  (etypecase spec
-    (list (if (keywordp (second spec))
-              (lisp-name (first spec) varp)
-              (if (symbolp (first spec))
-                  (first spec)
-                  (lisp-name (second spec) varp))))
-    (string (intern
-             (format nil (if varp "*~A*" "~A")
-                     (canonicalize-symbol-name-case
-                      (substitute #\- #\_ spec)))))
-    (symbol spec)))
-
-(defun foreign-name (spec &optional varp)
-  (etypecase spec
-    (list (if (stringp (second spec))
-              (second spec)
-              (foreign-name (first spec) varp)))
-    (string spec)
-    (symbol (let ((name (substitute #\_ #\-
-                                    (string-downcase (symbol-name spec)))))
-              (if varp
-                  (string-trim '(#\*) name)
-                  name)))))
-
-(defun foreign-options (spec varp)
-  (let ((opts (if (listp spec)
-                  (if (keywordp (second spec))
-                      (cdr spec)
-                      (cddr spec))
-                  nil)))
-    (if varp
-        (funcall 'parse-defcvar-options opts)
-        (parse-function-options opts))))
-
 (defun parse-name-and-options (spec &optional varp)
-  (values (lisp-name spec varp)
-          (foreign-name spec varp)
-          (foreign-options spec varp)))
+  (multiple-value-bind (lisp-name foreign-name options)
+      (%parse-name-and-options spec varp)
+    (values lisp-name foreign-name (foreign-options options varp))))
 
 ;;; If we find a &REST token at the end of ARGS, it means this is a
 ;;; varargs foreign function therefore we define a lisp macro using
@@ -267,7 +400,7 @@ arguments and does type promotion for the variadic arguments."
   (let ((docstring (when (stringp (car args)) (pop args))))
     (multiple-value-bind (lisp-name foreign-name options)
         (parse-name-and-options name-and-options)
-      (if (eq (car (last args)) '&rest)
+      (if (eq (lastcar args) '&rest)
           (%defcfun-varargs lisp-name foreign-name return-type
                             (butlast args) options docstring)
           (%defcfun lisp-name foreign-name return-type args options
